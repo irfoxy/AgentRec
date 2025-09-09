@@ -104,25 +104,34 @@ META_SYSTEM_PROMPT = (
     "Please ensure that the final answer strictly follows the question requirements, without any additional analysis.\n"
     "If the final ansert is not complete, emit a *new* JSON plan for the remaining work. Keep cycles as\n"
     "few as possible. Never call tools yourself — that's the EXECUTOR's job."
-    "⚠️  Reply with *pure JSON only*."
+    "⚠️ Reply with *pure JSON only*."
 )
 
 EXEC_SYSTEM_PROMPT = (
-    "You are the EXECUTOR sub-agent. You receive one task description at a time\n"
-    "from the meta-planner. Your job is to complete the task, using available\n"
-    "tools via function calling if needed. Always think step by step but reply\n"
-    "with the minimal content needed for the meta-planner. If you must call a\n"
-    "tool, produce the appropriate function call instead of natural language.\n"
-    "When done, output a concise result. Do NOT output FINAL ANSWER."
+    "You are the EXECUTOR sub-agent. You will first receive an initial task description from the user, and then you will receive one subtask at a time from the meta-planner."
+    "Your job is to complete the subtask, using available tools via function calling if needed."
+    "If no tools are available or tool calling is unnecessary, analyze the question and historical records to provide a natural language response."
+    "If you must call a tool, generate the appropriate function call instead of natural language."
+    "When done, do NOT output FINAL ANSWER."
 )
 
+MEMORY_UPDATER_PROMPT="""
+You are a memory-updater sub-agent. You receive a dialogue between the user and the assistant, 
+reference the feedback provided by the user at the end, extract all useful information from the entire conversation, and return it separated by carriage returns.
+Each line should be as concise and brief as possible.
+"""
+
 class Agent:
-    def __init__(self,model:str,role:str,memory_path:str) -> None:
-        self.planner=OpenAIBackend(model=model)
-        self.exec=OpenAIBackend(model=model)
+    def __init__(self,planner_model:str,exec_model:str,memory_model:str,role:str,memory_path:str) -> None:
+        self.planner=OpenAIBackend(model=planner_model)
+        self.exec=OpenAIBackend(model=exec_model)
+        self.memory_updater=OpenAIBackend(model=memory_model)
+
         self.role=role
         self.memory_path=memory_path
 
+        self.planner_msgs=[]
+    
     def extract_memory(self):
         with open(self.memory_path,'r',encoding='utf-8') as f:
             memory_list=[json.loads(line) for line in f if line.strip()]
@@ -171,19 +180,18 @@ class Agent:
                     result = tool_registry[name](**args)
 
                 current_msgs.append({
-                    "role": "tool",
+                    "role": "function",
                     "tool_call_id": tc["id"],
                     "name": name,
                     "content": json.dumps(result, ensure_ascii=False),
                 })
-
             resp = await self.exec.chat(current_msgs, tools=tools_schema, tool_choice="none")
 
         return resp["content"] or ""
 
     async def forward(self, question: str, tools: List[Dict[str, Any]], tool_registry: Mapping[str, Callable[..., Any]] | None = None):
 
-        planner_msgs = [
+        self.planner_msgs = [
             {"role": "system", "content": META_SYSTEM_PROMPT},
             {"role": "user", "content": question},
         ]
@@ -191,28 +199,31 @@ class Agent:
         memory_list = self.extract_memory()
         if memory_list:
             memory_prompt = self.build_memory_prompt(memory_list)
-            planner_msgs.append({"role": "user", "content": memory_prompt})
+            self.planner_msgs.append({"role": "user", "content": memory_prompt})
 
         for cyc in range(MAX_CYC):
-            resp = await self.planner.chat(planner_msgs)
+            resp = await self.planner.chat(self.planner_msgs)
             content = resp["content"] or ""
             print({"content": content, "tool_calls": resp["tool_calls"]})
 
             if content.strip().upper().startswith("FINAL ANSWER:"):
+                self.planner_msgs.append({"role":"assistant","content":content})
                 final_ans = content.split(":", 1)[1].strip()
                 print("FINAL ANSWER =>", final_ans)
                 return final_ans
 
             plan_lst = self.extract_plan_lst(content)
-            planner_msgs.append({'role':'assistant',"content":resp["content"]})
+            self.planner_msgs.append({'role':'assistant',"content":resp["content"]})
             
             exec_msgs=[{"role": "system", "content": EXEC_SYSTEM_PROMPT}]
+            exec_msgs.append({"role":"user","content":question})
+
             for task in plan_lst:
                 task_id = task.get("id")
                 task_desc = task.get("description", "")
-
+                print
                 print(f"[EXECUTE] Task {task_id}: {task_desc}")
-                exec_msgs.append({"role":"user","content":task_desc})
+                exec_msgs.append({"role":"assistant","content":task_desc})
 
                 result_text = await self._run_executor_once(
                     exec_msgs=exec_msgs,
@@ -222,19 +233,38 @@ class Agent:
                 print(f"[RESULT] Task {task_id}: {result_text}")
 
                 exec_msgs.append({
-                    "role": "user",
+                    "role": "assistant",
                     "content": f"Result for task {task_id}: {result_text}",
                 })
-                planner_msgs.append({
-                    "role": "user",
+                self.planner_msgs.append({
+                    "role": "assistant",
                     "content": f"Result for task {task_id}: {result_text}",
                 })
-            planner_msgs.append({
+            self.planner_msgs.append({
                     "role": "user",
                     "content": "All task results have been given above,try if you can give the FINAL answer.If can't create another plan instead",
                 })
-            print(planner_msgs)
         else:
             raise RuntimeError("Reached MAX_CYC but no FINAL ANSWER was produced.")
+    
+    async def backward(self,user_id:int,feedback:str):
+        self.planner_msgs.append({'role':'user','content':feedback})
+        self.planner_msgs=self.planner_msgs[1:]
+        
+        history=""
+        for row in self.planner_msgs:
+            history+=f"\n{row['role']}:{row['content']}"
+            history+='\n-------------------------------------------------'
 
+        memory_updater_msgs=[
+            {"role":"system","content":MEMORY_UPDATER_PROMPT},
+            {"role":"user","content":history}
+        ]
 
+        resp=await self.memory_updater.chat(memory_updater_msgs)
+        memory={"user_id":user_id,"role":self.role,memory:resp['content'].split('\n')}
+        with open(self.memory_path,'a',encoding='utf-8') as f:
+            f.write(json.dumps(memory,ensure_ascii=False)+'\n')
+        print(f"[MEMORY] saved")
+        
+        
