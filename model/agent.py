@@ -49,7 +49,7 @@ class OpenAIBackend(ChatBackend):
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]] | None = None,
         tool_choice: str | None = "auto",
-        max_tokens: int = 15000,
+        max_tokens: int = 1024,
     ) -> Dict[str, Any]:
         # 获取当前尝试次数
         current_attempt = getattr(self.chat.retry.statistics, "attempt_number", 0)
@@ -191,7 +191,7 @@ class Agent:
         memory_list = self.extract_memory()
         if memory_list:
             memory_prompt = self.build_memory_prompt(memory_list)
-            planner_msgs.append({"role": "user", "content": json.dumps(memory_prompt, ensure_ascii=False)})
+            planner_msgs.append({"role": "user", "content": memory_prompt})
 
         for cyc in range(MAX_CYC):
             resp = await self.planner.chat(planner_msgs)
@@ -204,7 +204,8 @@ class Agent:
                 return final_ans
 
             plan_lst = self.extract_plan_lst(content)
-
+            planner_msgs.append({'role':'assistant',"content":resp["content"]})
+            
             exec_msgs=[{"role": "system", "content": EXEC_SYSTEM_PROMPT}]
             for task in plan_lst:
                 task_id = task.get("id")
@@ -221,9 +222,19 @@ class Agent:
                 print(f"[RESULT] Task {task_id}: {result_text}")
 
                 exec_msgs.append({
-                    "role": "assistant",
+                    "role": "user",
                     "content": f"Result for task {task_id}: {result_text}",
                 })
+                planner_msgs.append({
+                    "role": "user",
+                    "content": f"Result for task {task_id}: {result_text}",
+                })
+            planner_msgs.append({
+                    "role": "user",
+                    "content": "All task results have been given above,try if you can give the FINAL answer.If can't create another plan instead",
+                })
+            print(planner_msgs)
         else:
             raise RuntimeError("Reached MAX_CYC but no FINAL ANSWER was produced.")
+
 
